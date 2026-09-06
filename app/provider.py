@@ -1,39 +1,52 @@
 import asyncio
+import os
 import re
-import time
 from typing import Any, Dict, List, Optional
 
-import httpx
 import yt_dlp
 from cachetools import TTLCache
 from ytmusicapi import YTMusic
 
-# In-Memory Cache: 2000 songs for 3 hours (10800 seconds)
-_stream_cache = TTLCache(maxsize=2000, ttl=10800)
-
+_stream_cache = TTLCache(maxsize=3000, ttl=10800)
 _ytmusic_client = YTMusic()
-DEFAULT_TIMEOUT = 12.0
 
-# Decentralized Public Piped Instances for emergency fallback
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://api.piped.privacy.com.de",
-    "https://piped-api.garudalinux.org",
-    "https://api.piped.yt",
+# 1. PROXY POOL SETUP (Environment variable से उठाएगा, अगर उपलब्ध हो)
+# Format: "http://user:pass@host:port,http://user:pass@host2:port"
+RAW_PROXIES = os.getenv("STREAM_PROXY_POOL", "").strip()
+PROXY_POOL = [p.strip() for p in RAW_PROXIES.split(",") if p.strip()]
+_proxy_index = 0
+
+def _get_next_proxy() -> Optional[str]:
+    global _proxy_index
+    if not PROXY_POOL:
+        return None
+    proxy = PROXY_POOL[_proxy_index % len(PROXY_POOL)]
+    _proxy_index += 1
+    return proxy
+
+# 2. FAILOVER CLIENT TIERS (Anti-Bot Bypass Profiles)
+CLIENT_TIERS = [
+    {
+        "name": "android_music",
+        "client": ["android_music"],
+        "user_agent": "com.google.android.apps.youtube.music/6.40.52 (Linux; U; Android 14) gzip",
+    },
+    {
+        "name": "tv_embedded",
+        "client": ["tvhtml5_embedded"],
+        "user_agent": "Mozilla/5.0 (PlayStation 4 5.05) AppleWebKit/601.2 (KHTML, like Gecko)",
+    },
+    {
+        "name": "ios_direct",
+        "client": ["ios"],
+        "user_agent": "com.google.ios.youtube/19.10.1 (iPhone14,3; U; CPU iOS 17_4 like Mac OS X)",
+    },
 ]
-
 
 def _clean_text(value: Any) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
-
-
-def _normalize_song_key(title: str, artist: str) -> str:
-    raw = f"{title} {artist}".lower()
-    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
-    return re.sub(r"\s+", " ", raw).strip()
-
 
 def _ytm_song_to_model(song: Dict[str, Any], rank: int) -> Dict[str, Any]:
     video_id = _clean_text(song.get("videoId"))
@@ -45,12 +58,12 @@ def _ytm_song_to_model(song: Dict[str, Any], rank: int) -> Dict[str, Any]:
     album = ""
     if isinstance(song.get("album"), dict):
         album = _clean_text(song["album"].get("name"))
-    
+
     thumbs = song.get("thumbnails") or []
     image_url = ""
     if isinstance(thumbs, list) and thumbs:
         image_url = _clean_text(thumbs[-1].get("url"))
-    
+
     duration_text = _clean_text(song.get("duration"))
     duration_ms = 0
     if duration_text:
@@ -63,7 +76,6 @@ def _ytm_song_to_model(song: Dict[str, Any], rank: int) -> Dict[str, Any]:
         except Exception:
             duration_ms = 0
 
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
     return {
         "id": f"ytm_{video_id}",
         "title": title,
@@ -76,10 +88,9 @@ def _ytm_song_to_model(song: Dict[str, Any], rank: int) -> Dict[str, Any]:
         "streamUrl": "",
         "backupUrls": [],
         "searchableText": f"{title} {artist} {album}".strip(),
-        "youtubeUrl": youtube_url,
+        "youtubeUrl": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
         "providerRank": rank,
     }
-
 
 def _ytmusic_search_sync(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     try:
@@ -90,29 +101,36 @@ def _ytmusic_search_sync(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                 out.append(_ytm_song_to_model(item, idx))
         return out
     except Exception as e:
-        print(f"[YTM SEARCH ERROR] {e}")
+        print(f"[METADATA SEARCH ERROR] {e}")
         return []
-
 
 async def search_all_sources(query: str) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(_ytmusic_search_sync, query)
 
-
-def _resolve_ytdlp_sync(video_id: str) -> Optional[Dict[str, Any]]:
+# 3. SELF-HEALING STREAM RESOLVER ENGINE
+def _extract_with_tier(video_id: str, tier: Dict[str, Any], proxy: Optional[str]) -> Optional[Dict[str, Any]]:
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    # Android & iOS client profile stops 429 Bot Check & n-token failure
+
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "format": "bestaudio/best",
+        "socket_timeout": 8,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "mweb"]
+                "player_client": tier["client"],
+                "player_skip": ["webpage", "configs"],
             }
         },
+        "http_headers": {
+            "User-Agent": tier["user_agent"],
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
+
+    if proxy:
+        opts["proxy"] = proxy
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -123,8 +141,8 @@ def _resolve_ytdlp_sync(video_id: str) -> Optional[Dict[str, Any]]:
         for fmt in formats:
             if not isinstance(fmt, dict):
                 continue
-            vcodec = fmt.get("vcodec")
             acodec = fmt.get("acodec")
+            vcodec = fmt.get("vcodec")
             url = fmt.get("url")
             if url and acodec != "none" and (vcodec == "none" or not vcodec):
                 audio_urls.append(str(url))
@@ -136,36 +154,28 @@ def _resolve_ytdlp_sync(video_id: str) -> Optional[Dict[str, Any]]:
                 "backupUrls": audio_urls[-5:],
             }
     except Exception as e:
-        print(f"[YTDLP PRIMARY ERROR] {e}")
+        print(f"[EXTRACTOR TIER FAILED] Tier: {tier['name']} | Proxy: {bool(proxy)} | Error: {e}")
 
     return None
 
+def _resolve_stream_resilient(video_id: str) -> Optional[Dict[str, Any]]:
+    # Attempt extraction across multiple tiers and routing states
+    for tier in CLIENT_TIERS:
+        # First attempt: Direct / Primary Routing
+        result = _extract_with_tier(video_id, tier, proxy=None)
+        if result and result.get("streamUrl"):
+            return result
 
-async def _resolve_piped_fallback(video_id: str) -> Optional[Dict[str, Any]]:
-    # Emergency fallback across decentralized nodes
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
-        for instance in PIPED_INSTANCES:
-            endpoint = f"{instance}/streams/{video_id}"
-            try:
-                res = await client.get(endpoint)
-                if res.status_code == 200:
-                    data = res.json()
-                    audio_streams = data.get("audioStreams") or []
-                    if audio_streams:
-                        # Highest bitrate stream
-                        best_stream = audio_streams[-1].get("url")
-                        if best_stream:
-                            return {
-                                "streamUrl": best_stream,
-                                "backupUrls": [s.get("url") for s in audio_streams if s.get("url")],
-                            }
-            except Exception:
-                continue
+        # Second attempt: Proxy Failover (if configured)
+        proxy = _get_next_proxy()
+        if proxy:
+            result = _extract_with_tier(video_id, tier, proxy=proxy)
+            if result and result.get("streamUrl"):
+                return result
+
     return None
-
 
 async def resolve_song_stream(song_id: str, title: str = "", artist: str = "") -> Optional[Dict[str, Any]]:
-    # 1. Extract Video ID
     video_id = ""
     if song_id.startswith("ytm_"):
         video_id = song_id.replace("ytm_", "", 1)
@@ -184,35 +194,23 @@ async def resolve_song_stream(song_id: str, title: str = "", artist: str = "") -
     if not video_id:
         return None
 
-    # 2. Check L1 Memory Cache (3 hours validity)
+    # Cache Lookup
     if video_id in _stream_cache:
-        cached_val = _stream_cache[video_id]
-        print(f"[CACHE HIT] Returning in-memory stream for: {video_id}")
-        return cached_val
+        return _stream_cache[video_id]
 
-    print(f"[CACHE MISS] Resolving fresh stream for: {video_id}")
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    # 3. Layer 1: yt-dlp Native Android Client
-    resolved = await asyncio.to_thread(_resolve_ytdlp_sync, video_id)
-
-    # 4. Layer 2: Emergency Piped Mesh Fallback
-    if not resolved or not resolved.get("streamUrl"):
-        print(f"[FALLBACK TRIGGERED] Switching to Piped mesh for: {video_id}")
-        resolved = await _resolve_piped_fallback(video_id)
+    # Automated Failover Execution
+    resolved = await asyncio.to_thread(_resolve_stream_resilient, video_id)
 
     if resolved and resolved.get("streamUrl"):
         output = {
-            "youtubeUrl": youtube_url,
+            "youtubeUrl": f"https://www.youtube.com/watch?v={video_id}",
             "streamUrl": resolved.get("streamUrl"),
             "backupUrls": resolved.get("backupUrls", []),
         }
-        # Save in Cache
         _stream_cache[video_id] = output
         return output
 
     return None
-
 
 async def get_trending_like_songs() -> List[Dict[str, Any]]:
     return await search_all_sources("top hindi songs")
