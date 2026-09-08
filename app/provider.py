@@ -1,323 +1,231 @@
 import asyncio
+import os
+import re
 from typing import Any, Dict, List, Optional
 
-import httpx
+import yt_dlp
+from cachetools import TTLCache
+from ytmusicapi import YTMusic
+
+# TTL cache for resolved streams (3 hours expiry, max 3000 items)
+_stream_cache = TTLCache(maxsize=3000, ttl=10800)
+_ytmusic_client = YTMusic()
+
+# 1. PROXY POOL SETUP
+RAW_PROXIES = os.getenv("STREAM_PROXY_POOL", "").strip()
+PROXY_POOL = [p.strip() for p in RAW_PROXIES.split(",") if p.strip()]
+_proxy_index = 0
 
 
-JIOSAAVN_API_BASE = "https://saavn.dev/api"
-
-_http_client: Optional[httpx.AsyncClient] = None
-
-
-async def get_http_client() -> httpx.AsyncClient:
-    global _http_client
-
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            base_url=JIOSAAVN_API_BASE,
-            timeout=httpx.Timeout(
-                connect=10.0,
-                read=20.0,
-                write=20.0,
-                pool=20.0,
-            ),
-            follow_redirects=True,
-            headers={
-                "Accept": "application/json",
-            },
-        )
-
-    return _http_client
+def _get_next_proxy() -> Optional[str]:
+    global _proxy_index
+    if not PROXY_POOL:
+        return None
+    proxy = PROXY_POOL[_proxy_index % len(PROXY_POOL)]
+    _proxy_index += 1
+    return proxy
 
 
-async def close_http_client() -> None:
-    global _http_client
-
-    if _http_client is not None and not _http_client.is_closed:
-        await _http_client.aclose()
-
-    _http_client = None
+# 2. FAILOVER CLIENT TIERS (Anti-Bot Bypass Profiles)
+CLIENT_TIERS = [
+    {
+        "name": "android_music",
+        "client": ["android_music"],
+        "user_agent": "com.google.android.apps.youtube.music/6.40.52 (Linux; U; Android 14) gzip",
+    },
+    {
+        "name": "tv_embedded",
+        "client": ["tvhtml5_embedded"],
+        "user_agent": "Mozilla/5.0 (PlayStation 4 5.05) AppleWebKit/601.2 (KHTML, like Gecko)",
+    },
+    {
+        "name": "ios_direct",
+        "client": ["ios"],
+        "user_agent": "com.google.ios.youtube/19.10.1 (iPhone14,3; U; CPU iOS 17_4 like Mac OS X)",
+    },
+]
 
 
 def _clean_text(value: Any) -> str:
     if value is None:
         return ""
-
-    return str(value).strip()
-
-
-def _safe_int(value: Any, fallback: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return fallback
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def _first_image_url(images: Any) -> str:
-    if not isinstance(images, list):
-        return ""
+def _ytm_song_to_model(song: Dict[str, Any], rank: int) -> Dict[str, Any]:
+    video_id = _clean_text(song.get("videoId"))
+    title = _clean_text(song.get("title"))
+    artists = song.get("artists") or []
+    artist = ", ".join(
+        _clean_text(a.get("name")) for a in artists if isinstance(a, dict) and a.get("name")
+    )
+    album = ""
+    if isinstance(song.get("album"), dict):
+        album = _clean_text(song["album"].get("name"))
 
-    for image in reversed(images):
-        if not isinstance(image, dict):
-            continue
+    thumbs = song.get("thumbnails") or []
+    image_url = ""
+    if isinstance(thumbs, list) and thumbs:
+        image_url = _clean_text(thumbs[-1].get("url"))
 
-        image_url = _clean_text(image.get("url"))
-
-        if image_url:
-            return image_url
-
-    return ""
-
-
-def _first_download_url(download_urls: Any) -> str:
-    if not isinstance(download_urls, list):
-        return ""
-
-    for item in reversed(download_urls):
-        if not isinstance(item, dict):
-            continue
-
-        download_url = _clean_text(item.get("url"))
-
-        if download_url:
-            return download_url
-
-    return ""
-
-
-def _artist_names(song: Dict[str, Any]) -> str:
-    artists = song.get("artists")
-
-    if not isinstance(artists, dict):
-        return "Unknown artist"
-
-    primary_artists = artists.get("primary")
-
-    if not isinstance(primary_artists, list):
-        return "Unknown artist"
-
-    names: List[str] = []
-
-    for artist in primary_artists:
-        if not isinstance(artist, dict):
-            continue
-
-        name = _clean_text(artist.get("name"))
-
-        if name:
-            names.append(name)
-
-    return ", ".join(names) if names else "Unknown artist"
-
-
-def _album_name(song: Dict[str, Any]) -> str:
-    album = song.get("album")
-
-    if not isinstance(album, dict):
-        return ""
-
-    return _clean_text(album.get("name"))
-
-
-def _format_song(song: Dict[str, Any]) -> Dict[str, Any]:
-    song_id = _clean_text(song.get("id"))
-    duration_seconds = _safe_int(song.get("duration"))
+    duration_text = _clean_text(song.get("duration"))
+    duration_ms = 0
+    if duration_text:
+        parts = duration_text.split(":")
+        try:
+            total = 0
+            for p in parts:
+                total = total * 60 + int(p)
+            duration_ms = total * 1000
+        except Exception:
+            duration_ms = 0
 
     return {
-        "id": song_id,
-        "title": _clean_text(song.get("name")) or "Unknown title",
-        "artist": _artist_names(song),
-        "album": _album_name(song),
-        "imageUrl": _first_image_url(song.get("image")),
-        "durationMs": duration_seconds * 1000,
-        "sourceType": "catalog",
-        "sourceId": song_id,
-        "streamUrl": _first_download_url(song.get("downloadUrl")),
+        "id": f"ytm_{video_id}",
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "imageUrl": image_url,
+        "durationMs": duration_ms,
+        "sourceType": "youtube_music",
+        "sourceId": video_id,
+        "streamUrl": "",
         "backupUrls": [],
+        "searchableText": f"{title} {artist} {album}".strip(),
+        "youtubeUrl": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+        "providerRank": rank,
     }
 
 
-async def _get_json(
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    client = await get_http_client()
-
-    response = await client.get(path, params=params)
-    response.raise_for_status()
-
-    payload = response.json()
-
-    if not isinstance(payload, dict):
-        raise ValueError("Music provider returned invalid JSON")
-
-    return payload
-
-
-def _extract_song_list(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    raw_data = payload.get("data")
-
-    if isinstance(raw_data, list):
-        return [
-            item
-            for item in raw_data
-            if isinstance(item, dict)
-        ]
-
-    if isinstance(raw_data, dict):
-        results = raw_data.get("results")
-
-        if isinstance(results, list):
-            return [
-                item
-                for item in results
-                if isinstance(item, dict)
-            ]
-
-        songs = raw_data.get("songs")
-
-        if isinstance(songs, list):
-            return [
-                item
-                for item in songs
-                if isinstance(item, dict)
-            ]
-
-    return []
-
-
-async def search_all_sources(
-    query: str,
-    limit: int = 20,
-) -> List[Dict[str, Any]]:
-    clean_query = query.strip()
-
-    if not clean_query:
+def _ytm_search_sync(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    try:
+        results = _ytmusic_client.search(query, filter="songs", limit=limit) or []
+        out = []
+        for idx, item in enumerate(results):
+            if isinstance(item, dict) and item.get("videoId"):
+                out.append(_ytm_song_to_model(item, idx))
+        return out
+    except Exception as e:
+        print(f"[METADATA SEARCH ERROR] {e}")
         return []
+
+
+async def search_all_sources(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(_ytm_search_sync, query, limit)
+
+
+# 3. SELF-HEALING STREAM RESOLVER ENGINE
+def _extract_with_tier(video_id: str, tier: Dict[str, Any], proxy: Optional[str]) -> Optional[Dict[str, Any]]:
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "format": "bestaudio/best",
+        "socket_timeout": 10,
+        "extractor_args": {
+            "youtube": {
+                "player_client": tier["client"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": tier["user_agent"],
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+
+    if proxy:
+        opts["proxy"] = proxy
 
     try:
-        payload = await _get_json(
-            "/search/songs",
-            {
-                "query": clean_query,
-                "page": 1,
-                "limit": limit,
-            },
-        )
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
 
-        raw_songs = _extract_song_list(payload)
-        formatted_songs = [_format_song(song) for song in raw_songs]
-
-        print(
-            f"[SEARCH] query={clean_query!r}, "
-            f"provider_songs={len(raw_songs)}, "
-            f"formatted_songs={len(formatted_songs)}"
-        )
-
-        return formatted_songs
-
-    except httpx.HTTPStatusError as error:
-        print(
-            f"[SEARCH HTTP ERROR] query={clean_query!r}, "
-            f"status={error.response.status_code}, "
-            f"body={error.response.text[:500]}"
-        )
-        return []
-
-    except httpx.HTTPError as error:
-        print(f"[SEARCH NETWORK ERROR] query={clean_query!r}, error={error!r}")
-        return []
-
-    except Exception as error:
-        print(f"[SEARCH ERROR] query={clean_query!r}, error={error!r}")
-        return []
-
-
-async def get_trending_like_songs(
-    limit: int = 20,
-) -> List[Dict[str, Any]]:
-    queries = [
-        "Hindi hits",
-        "Punjabi hits",
-        "Arijit Singh",
-    ]
-
-    responses = await asyncio.gather(
-        *[
-            search_all_sources(query, limit=10)
-            for query in queries
-        ],
-        return_exceptions=True,
-    )
-
-    songs: List[Dict[str, Any]] = []
-    seen_song_ids: set[str] = set()
-
-    for query, response in zip(queries, responses):
-        if isinstance(response, Exception):
-            print(f"[TRENDING ERROR] query={query!r}, error={response!r}")
-            continue
-
-        print(f"[TRENDING] query={query!r}, received={len(response)}")
-
-        for song in response:
-            song_id = _clean_text(song.get("id"))
-
-            if not song_id or song_id in seen_song_ids:
-                continue
-
-            seen_song_ids.add(song_id)
-            songs.append(song)
-
-            if len(songs) >= limit:
-                return songs
-
-    print(f"[TRENDING] final_song_count={len(songs)}")
-    return songs
-
-
-async def resolve_song_stream(song_id: str) -> Optional[Dict[str, Any]]:
-    clean_song_id = song_id.strip()
-
-    if not clean_song_id:
-        return None
-
-    try:
-        payload = await _get_json(
-            "/songs",
-            {
-                "id": clean_song_id,
-            },
-        )
-
-        songs = _extract_song_list(payload)
-
-        if not songs:
-            print(f"[RESOLVE] no song returned for id={clean_song_id!r}")
+        if not info:
             return None
 
-        formatted_song = _format_song(songs[0])
+        formats = info.get("formats") or []
+        audio_urls = []
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+            acodec = fmt.get("acodec")
+            vcodec = fmt.get("vcodec")
+            url = fmt.get("url")
+            if url and acodec != "none" and (vcodec == "none" or not vcodec):
+                audio_urls.append(str(url))
 
-        print(
-            f"[RESOLVE] id={clean_song_id!r}, "
-            f"title={formatted_song['title']!r}, "
-            f"has_stream_url={bool(formatted_song['streamUrl'])}"
-        )
+        best_url = audio_urls[-1] if audio_urls else str(info.get("url") or "")
+        if best_url:
+            return {
+                "streamUrl": best_url,
+                "backupUrls": audio_urls[-5:],
+            }
+    except Exception as e:
+        print(f"[EXTRACTOR TIER FAILED] Tier: {tier['name']} | Proxy: {bool(proxy)} | Error: {e}")
 
-        return formatted_song
+    return None
 
-    except httpx.HTTPStatusError as error:
-        print(
-            f"[RESOLVE HTTP ERROR] id={clean_song_id!r}, "
-            f"status={error.response.status_code}, "
-            f"body={error.response.text[:500]}"
-        )
+
+def _resolve_stream_resilient(video_id: str) -> Optional[Dict[str, Any]]:
+    for tier in CLIENT_TIERS:
+        # First attempt: Direct / Primary Routing
+        result = _extract_with_tier(video_id, tier, proxy=None)
+        if result and result.get("streamUrl"):
+            return result
+
+        # Second attempt: Proxy Failover (if configured)
+        proxy = _get_next_proxy()
+        if proxy:
+            result = _extract_with_tier(video_id, tier, proxy=proxy)
+            if result and result.get("streamUrl"):
+                return result
+
+    return None
+
+
+async def resolve_song_stream(song_id: str, title: str = "", artist: str = "") -> Optional[Dict[str, Any]]:
+    video_id = ""
+    if song_id.startswith("ytm_"):
+        video_id = song_id.replace("ytm_", "", 1)
+    elif song_id.strip():
+        video_id = song_id.strip()
+
+    if not video_id:
+        search_query = f"{title} {artist}".strip()
+        if not search_query:
+            return None
+        ytm_results = await search_all_sources(search_query, limit=1)
+        if not ytm_results:
+            return None
+        video_id = ytm_results[0].get("sourceId", "")
+
+    if not video_id:
         return None
 
-    except httpx.HTTPError as error:
-        print(f"[RESOLVE NETWORK ERROR] id={clean_song_id!r}, error={error!r}")
-        return None
+    # Cache Lookup
+    if video_id in _stream_cache:
+        cached = _stream_cache[video_id]
+        if cached and cached.get("streamUrl"):
+            return cached
 
-    except Exception as error:
-        print(f"[RESOLVE ERROR] id={clean_song_id!r}, error={error!r}")
-        return None
+    # Automated Failover Execution
+    resolved = await asyncio.to_thread(_resolve_stream_resilient, video_id)
+
+    if resolved and resolved.get("streamUrl"):
+        output = {
+            "youtubeUrl": f"https://www.youtube.com/watch?v={video_id}",
+            "streamUrl": resolved.get("streamUrl"),
+            "backupUrls": resolved.get("backupUrls", []),
+        }
+        _stream_cache[video_id] = output
+        return output
+
+    return None
+
+
+async def get_trending_like_songs(limit: int = 20) -> List[Dict[str, Any]]:
+    # ✅ Fixed to accept limit parameter securely
+    return await search_all_sources("top hindi songs", limit=limit)
