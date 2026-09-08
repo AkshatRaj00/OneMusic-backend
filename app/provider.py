@@ -1,6 +1,8 @@
 import asyncio
 import os
 import re
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional
 
 import yt_dlp
@@ -94,26 +96,38 @@ async def search_all_sources(query: str) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(_ytmusic_search_sync, query)
 
 
-def _get_cookie_file() -> Optional[str]:
+def _get_secret_cookie_file() -> Optional[str]:
     cookie_file = os.getenv("YTDLP_COOKIE_FILE", "").strip()
 
     if cookie_file and os.path.isfile(cookie_file):
         return cookie_file
 
-    local_cookie_file = os.path.join(
-        os.path.dirname(__file__),
-        "cookies.txt",
-    )
-
-    if os.path.isfile(local_cookie_file):
-        return local_cookie_file
-
     return None
+
+
+def _make_writable_cookie_copy() -> Optional[str]:
+    secret_file = _get_secret_cookie_file()
+
+    if not secret_file:
+        print("[RESOLVER] No cookies file configured.")
+        return None
+
+    try:
+        temp_dir = tempfile.gettempdir()
+        writable_cookie_file = os.path.join(temp_dir, "youtube_cookies.txt")
+
+        shutil.copyfile(secret_file, writable_cookie_file)
+
+        print("[RESOLVER] Using configured YouTube cookies.")
+        return writable_cookie_file
+    except Exception as error:
+        print(f"[RESOLVER] Could not copy cookie file: {error}")
+        return None
 
 
 def _extract_audio_stream(video_id: str) -> Optional[Dict[str, Any]]:
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    cookie_file = _get_cookie_file()
+    writable_cookie_file = _make_writable_cookie_copy()
 
     options: Dict[str, Any] = {
         "quiet": True,
@@ -123,6 +137,7 @@ def _extract_audio_stream(video_id: str) -> Optional[Dict[str, Any]]:
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
+        "cachedir": False,
         "format": (
             "bestaudio[acodec!=none][protocol=https]"
             "/bestaudio[acodec!=none]"
@@ -143,18 +158,14 @@ def _extract_audio_stream(video_id: str) -> Optional[Dict[str, Any]]:
         },
     }
 
-    if cookie_file:
-        options["cookiefile"] = cookie_file
-        print("[RESOLVER] Using configured YouTube cookies.")
-    else:
-        print("[RESOLVER] No cookies file configured.")
+    if writable_cookie_file:
+        options["cookiefile"] = writable_cookie_file
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(youtube_url, download=False)
 
         formats = info.get("formats") or []
-
         candidates: List[Dict[str, Any]] = []
 
         for fmt in formats:
@@ -213,7 +224,6 @@ def _extract_audio_stream(video_id: str) -> Optional[Dict[str, Any]]:
         fallback_url = str(info.get("url") or "").strip()
 
         if fallback_url.startswith(("http://", "https://")):
-            print(f"[RESOLVER] Using fallback URL for {video_id}")
             return {
                 "streamUrl": fallback_url,
                 "backupUrls": [],
@@ -225,6 +235,13 @@ def _extract_audio_stream(video_id: str) -> Optional[Dict[str, Any]]:
     except Exception as error:
         print(f"[RESOLVER ERROR] video={video_id} | {error}")
         return None
+
+    finally:
+        if writable_cookie_file:
+            try:
+                os.remove(writable_cookie_file)
+            except OSError:
+                pass
 
 
 async def resolve_song_stream(
@@ -274,7 +291,6 @@ async def resolve_song_stream(
     }
 
     _stream_cache[video_id] = output
-
     return output
 
 
