@@ -1,158 +1,197 @@
-import asyncio
-import re
-from typing import Any, Dict, List, Optional
+import 'dart:async';
 
-from cachetools import TTLCache
-from ytmusicapi import YTMusic
+import 'package:flutter/foundation.dart';
+import 'package:just_audio/just_audio.dart';
 
+import '../core/services/music_api_service.dart';
+import '../models/song_model.dart';
 
-_stream_cache = TTLCache(maxsize=500, ttl=3600)
-_ytmusic_client = YTMusic()
+class MusicPlayerProvider extends ChangeNotifier {
+  final AudioPlayer _audioPlayer = AudioPlayer();
 
-# Temporary stable MP3 for player/backend testing.
-# Later replace this with your own licensed MP3 hosting URL.
-_TEST_AUDIO_URL = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+  StreamSubscription<PlayerState>? _playerStateSubscription;
+  Timer? _debounceTimer;
 
+  List<SongModel> _songs = [];
+  SongModel? _currentSong;
+  bool _isLoading = false;
+  bool _isSearching = false;
+  String _error = '';
+  int _playRequestId = 0;
 
-def _clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
+  MusicPlayerProvider() {
+    _initPlayerListeners();
+  }
 
+  List<SongModel> get songs => List.unmodifiable(_songs);
+  SongModel? get currentSong => _currentSong;
+  bool get isLoading => _isLoading;
+  bool get isSearching => _isSearching;
+  String get error => _error;
 
-def _ytm_song_to_model(song: Dict[str, Any], rank: int) -> Dict[str, Any]:
-    video_id = _clean_text(song.get("videoId"))
-    title = _clean_text(song.get("title"))
+  bool get isPlaying => _audioPlayer.playing;
+  Duration get position => _audioPlayer.position;
+  Duration? get duration => _audioPlayer.duration;
 
-    artists = song.get("artists") or []
-    artist = ", ".join(
-        _clean_text(item.get("name"))
-        for item in artists
-        if isinstance(item, dict) and item.get("name")
-    )
+  Stream<Duration> get positionStream => _audioPlayer.positionStream;
+  Stream<Duration?> get durationStream => _audioPlayer.durationStream;
 
-    album = ""
-    if isinstance(song.get("album"), dict):
-        album = _clean_text(song["album"].get("name"))
+  void _initPlayerListeners() {
+    _playerStateSubscription = _audioPlayer.playerStateStream.listen(
+      (state) {
+        if (state.processingState == ProcessingState.completed) {
+          _audioPlayer.seek(Duration.zero);
+          _audioPlayer.pause();
+        }
 
-    thumbnails = song.get("thumbnails") or []
-    image_url = ""
-    if isinstance(thumbnails, list) and thumbnails:
-        image_url = _clean_text(thumbnails[-1].get("url"))
+        notifyListeners();
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('[PLAYER STREAM ERROR] $error');
+        debugPrintStack(stackTrace: stackTrace);
 
-    duration_ms = 0
-    duration_text = _clean_text(song.get("duration"))
+        _error = 'Playback error: $error';
+        _isLoading = false;
+        notifyListeners();
+      },
+    );
+  }
 
-    if duration_text:
-        try:
-            seconds = 0
-            for part in duration_text.split(":"):
-                seconds = seconds * 60 + int(part)
-            duration_ms = seconds * 1000
-        except (TypeError, ValueError):
-            duration_ms = 0
+  Future<void> loadTrending() async {
+    _isLoading = true;
+    _error = '';
+    notifyListeners();
 
-    return {
-        "id": f"ytm_{video_id}",
-        "title": title,
-        "artist": artist,
-        "album": album,
-        "imageUrl": image_url,
-        "durationMs": duration_ms,
-        "sourceType": "youtube_music",
-        "sourceId": video_id,
-        "streamUrl": "",
-        "backupUrls": [],
-        "searchableText": f"{title} {artist} {album}".strip(),
-        "youtubeUrl": (
-            f"https://www.youtube.com/watch?v={video_id}"
-            if video_id
-            else ""
-        ),
-        "providerRank": rank,
+    try {
+      _songs = await MusicApiService.instance.fetchTrendingSongs();
+    } catch (error, stackTrace) {
+      debugPrint('[TRENDING ERROR] $error');
+      debugPrintStack(stackTrace: stackTrace);
+
+      _songs = [];
+      _error = 'Trending songs load nahi hue.';
+    } finally {
+      _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> searchSongs(String query) async {
+    final cleanQuery = query.trim();
+
+    _debounceTimer?.cancel();
+
+    if (cleanQuery.isEmpty) {
+      _songs = [];
+      _error = '';
+      _isSearching = false;
+      notifyListeners();
+      return;
     }
 
+    _debounceTimer = Timer(
+      const Duration(milliseconds: 500),
+      () async {
+        _isSearching = true;
+        _error = '';
+        notifyListeners();
 
-def _ytmusic_search_sync(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    try:
-        results = _ytmusic_client.search(
-            query,
-            filter="songs",
-            limit=limit,
-        ) or []
+        try {
+          _songs = await MusicApiService.instance.searchSongs(cleanQuery);
+        } catch (error, stackTrace) {
+          debugPrint('[SEARCH ERROR] $error');
+          debugPrintStack(stackTrace: stackTrace);
 
-        output: List[Dict[str, Any]] = []
+          _songs = [];
+          _error = 'Search complete nahi hui.';
+        } finally {
+          _isSearching = false;
+          notifyListeners();
+        }
+      },
+    );
+  }
 
-        for index, item in enumerate(results):
-            if isinstance(item, dict) and item.get("videoId"):
-                output.append(_ytm_song_to_model(item, index))
+  Future<void> playSong(SongModel song) async {
+    final requestId = ++_playRequestId;
 
-        return output
+    _isLoading = true;
+    _error = '';
+    notifyListeners();
 
-    except Exception as error:
-        print(f"[YTMUSIC SEARCH ERROR] {error}")
-        return []
+    try {
+      await _audioPlayer.stop();
 
+      final playable =
+          await MusicApiService.instance.resolvePlayableSong(song);
 
-async def search_all_sources(query: str) -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_ytmusic_search_sync, query)
+      if (requestId != _playRequestId) {
+        return;
+      }
 
+      if (playable == null || playable.streamUrl.trim().isEmpty) {
+        throw Exception('Playable stream URL not resolved');
+      }
 
-def _extract_audio_stream(video_id: str) -> Optional[Dict[str, Any]]:
-    print(f"[RESOLVER] Test audio stream returned for video={video_id}")
+      final streamUri = Uri.tryParse(playable.streamUrl.trim());
 
-    return {
-        "streamUrl": _TEST_AUDIO_URL,
-        "backupUrls": [],
+      if (streamUri == null ||
+          !streamUri.hasScheme ||
+          !['https', 'http'].contains(streamUri.scheme)) {
+        throw Exception('Invalid audio stream URL');
+      }
+
+      await _audioPlayer.setAudioSource(
+        AudioSource.uri(streamUri),
+      );
+
+      if (requestId != _playRequestId) {
+        return;
+      }
+
+      _currentSong = playable;
+
+      await _audioPlayer.play();
+    } catch (error, stackTrace) {
+      debugPrint('[PLAY ERROR] $error');
+      debugPrintStack(stackTrace: stackTrace);
+
+      if (requestId == _playRequestId) {
+        _currentSong = null;
+        _error = 'Playback failed: $error';
+      }
+
+      try {
+        await _audioPlayer.stop();
+      } catch (_) {}
+    } finally {
+      if (requestId == _playRequestId) {
+        _isLoading = false;
+        notifyListeners();
+      }
     }
+  }
 
+  Future<void> pause() async {
+    await _audioPlayer.pause();
+    notifyListeners();
+  }
 
-async def resolve_song_stream(
-    song_id: str,
-    title: str = "",
-    artist: str = "",
-) -> Optional[Dict[str, Any]]:
-    video_id = _clean_text(song_id)
+  Future<void> resume() async {
+    await _audioPlayer.play();
+    notifyListeners();
+  }
 
-    if video_id.startswith("ytm_"):
-        video_id = video_id[4:]
+  Future<void> seek(Duration targetPosition) async {
+    await _audioPlayer.seek(targetPosition);
+  }
 
-    if not video_id:
-        search_query = f"{title} {artist}".strip()
-
-        if not search_query:
-            return None
-
-        results = await search_all_sources(search_query)
-
-        if not results:
-            return None
-
-        video_id = _clean_text(results[0].get("sourceId"))
-
-    if not video_id:
-        return None
-
-    cached = _stream_cache.get(video_id)
-
-    if cached:
-        print(f"[RESOLVER] Cache hit: {video_id}")
-        return cached
-
-    resolved = _extract_audio_stream(video_id)
-
-    if not resolved or not resolved.get("streamUrl"):
-        return None
-
-    output = {
-        "youtubeUrl": f"https://www.youtube.com/watch?v={video_id}",
-        "streamUrl": resolved["streamUrl"],
-        "backupUrls": resolved.get("backupUrls", []),
-    }
-
-    _stream_cache[video_id] = output
-    return output
-
-
-async def get_trending_like_songs() -> List[Dict[str, Any]]:
-    return await search_all_sources("top hindi songs")
+  @override
+  void dispose() {
+    _playRequestId++;
+    _debounceTimer?.cancel();
+    _playerStateSubscription?.cancel();
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+}
