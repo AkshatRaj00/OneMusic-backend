@@ -1,196 +1,182 @@
-import 'dart:async';
+import asyncio
+from typing import Any, Dict, List, Optional
 
-import 'package:flutter/foundation.dart';
-import 'package:just_audio/just_audio.dart';
+import httpx
 
-import '../core/services/music_api_service.dart';
-import '../models/song_model.dart';
 
-class MusicPlayerProvider extends ChangeNotifier {
-  final AudioPlayer _audioPlayer = AudioPlayer();
+JIOSAAVN_API_BASE = "https://saavn.dev/api"
 
-  StreamSubscription<PlayerState>? _playerStateSubscription;
-  Timer? _debounceTimer;
 
-  List<SongModel> _songs = [];
-  SongModel? _currentSong;
-  bool _isLoading = false;
-  bool _isSearching = false;
-  String _error = '';
-  int _playRequestId = 0;
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
 
-  MusicPlayerProvider() {
-    _initPlayerListeners();
-  }
+    if isinstance(value, str):
+        return value.strip()
 
-  List<SongModel> get songs => List.unmodifiable(_songs);
-  SongModel? get currentSong => _currentSong;
-  bool get isLoading => _isLoading;
-  bool get isSearching => _isSearching;
-  String get error => _error;
+    return str(value).strip()
 
-  bool get isPlaying => _audioPlayer.playing;
-  Duration get position => _audioPlayer.position;
-  Duration? get duration => _audioPlayer.duration;
 
-  Stream<Duration> get positionStream => _audioPlayer.positionStream;
-  Stream<Duration?> get durationStream => _audioPlayer.durationStream;
+def _first_image_url(images: Any) -> str:
+    if not isinstance(images, list):
+        return ""
 
-  void _initPlayerListeners() {
-    _playerStateSubscription = _audioPlayer.playerStateStream.listen(
-      (state) {
-        if (state.processingState == ProcessingState.completed) {
-          _audioPlayer.seek(Duration.zero);
-        }
+    for image in reversed(images):
+        if isinstance(image, dict):
+            url = _clean_text(image.get("url"))
+            if url:
+                return url
 
-        notifyListeners();
-      },
-      onError: (Object error, StackTrace stackTrace) {
-        debugPrint('[PLAYER STREAM ERROR] $error');
-        debugPrintStack(stackTrace: stackTrace);
+    return ""
 
-        _error = 'Playback error: $error';
-        _isLoading = false;
-        notifyListeners();
-      },
-    );
-  }
 
-  Future<void> loadTrending() async {
-    _isLoading = true;
-    _error = '';
-    notifyListeners();
+def _first_download_url(download_urls: Any) -> str:
+    if not isinstance(download_urls, list):
+        return ""
 
-    try {
-      _songs = await MusicApiService.instance.fetchTrendingSongs();
-    } catch (error, stackTrace) {
-      debugPrint('[TRENDING ERROR] $error');
-      debugPrintStack(stackTrace: stackTrace);
+    for item in reversed(download_urls):
+        if isinstance(item, dict):
+            url = _clean_text(item.get("url"))
+            if url:
+                return url
 
-      _songs = [];
-      _error = 'Trending songs load nahi hue.';
-    } finally {
-      _isLoading = false;
-      notifyListeners();
-    }
-  }
+    return ""
 
-  Future<void> searchSongs(String query) async {
-    final cleanQuery = query.trim();
 
-    _debounceTimer?.cancel();
+def _format_song(song: Dict[str, Any]) -> Dict[str, Any]:
+    artists = song.get("artists", {})
+    primary_artists = artists.get("primary", []) if isinstance(artists, dict) else []
 
-    if (cleanQuery.isEmpty) {
-      _songs = [];
-      _error = '';
-      _isSearching = false;
-      notifyListeners();
-      return;
+    artist_names = [
+        _clean_text(artist.get("name"))
+        for artist in primary_artists
+        if isinstance(artist, dict) and _clean_text(artist.get("name"))
+    ]
+
+    album = song.get("album", {})
+    album_name = _clean_text(album.get("name")) if isinstance(album, dict) else ""
+
+    return {
+        "id": _clean_text(song.get("id")),
+        "title": _clean_text(song.get("name")) or "Unknown title",
+        "artist": ", ".join(artist_names) or "Unknown artist",
+        "album": album_name,
+        "image": _first_image_url(song.get("image")),
+        "duration": int(song.get("duration") or 0),
+        "streamUrl": _first_download_url(song.get("downloadUrl")),
     }
 
-    _debounceTimer = Timer(
-      const Duration(milliseconds: 500),
-      () async {
-        _isSearching = true;
-        _error = '';
-        notifyListeners();
 
-        try {
-          _songs = await MusicApiService.instance.searchSongs(cleanQuery);
-        } catch (error, stackTrace) {
-          debugPrint('[SEARCH ERROR] $error');
-          debugPrintStack(stackTrace: stackTrace);
+async def _get_json(
+    client: httpx.AsyncClient,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    response = await client.get(path, params=params)
+    response.raise_for_status()
 
-          _songs = [];
-          _error = 'Search complete nahi hui.';
-        } finally {
-          _isSearching = false;
-          notifyListeners();
-        }
-      },
-    );
-  }
+    data = response.json()
 
-  Future<void> playSong(SongModel song) async {
-    final requestId = ++_playRequestId;
+    if not isinstance(data, dict):
+        raise ValueError("Invalid API response")
 
-    _isLoading = true;
-    _error = '';
-    notifyListeners();
+    return data
 
-    try {
-      await _audioPlayer.stop();
 
-      final playable =
-          await MusicApiService.instance.resolvePlayableSong(song);
+async def search_all_sources(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    clean_query = query.strip()
 
-      if (requestId != _playRequestId) {
-        return;
-      }
+    if not clean_query:
+        return []
 
-      if (playable == null || playable.streamUrl.trim().isEmpty) {
-        throw Exception('Playable stream URL not resolved');
-      }
+    async with httpx.AsyncClient(
+        base_url=JIOSAAVN_API_BASE,
+        timeout=httpx.Timeout(20.0),
+        follow_redirects=True,
+        headers={"Accept": "application/json"},
+    ) as client:
+        data = await _get_json(
+            client,
+            "/search/songs",
+            {"query": clean_query, "page": 1, "limit": limit},
+        )
 
-      final streamUri = Uri.tryParse(playable.streamUrl.trim());
+    results = data.get("data", {}).get("results", [])
+    if not isinstance(results, list):
+        return []
 
-      if (streamUri == null ||
-          !streamUri.hasScheme ||
-          !['https', 'http'].contains(streamUri.scheme)) {
-        throw Exception('Invalid audio stream URL');
-      }
+    return [_format_song(song) for song in results if isinstance(song, dict)]
 
-      await _audioPlayer.setAudioSource(
-        AudioSource.uri(streamUri),
-      );
 
-      if (requestId != _playRequestId) {
-        return;
-      }
+async def get_trending_like_songs(limit: int = 20) -> List[Dict[str, Any]]:
+    queries = ["Hindi hits", "Punjabi hits", "Indian pop"]
 
-      _currentSong = playable;
+    async with httpx.AsyncClient(
+        base_url=JIOSAAVN_API_BASE,
+        timeout=httpx.Timeout(20.0),
+        follow_redirects=True,
+        headers={"Accept": "application/json"},
+    ) as client:
+        responses = await asyncio.gather(
+            *[
+                _get_json(
+                    client,
+                    "/search/songs",
+                    {"query": query, "page": 1, "limit": 10},
+                )
+                for query in queries
+            ],
+            return_exceptions=True,
+        )
 
-      await _audioPlayer.play();
-    } catch (error, stackTrace) {
-      debugPrint('[PLAY ERROR] $error');
-      debugPrintStack(stackTrace: stackTrace);
+    songs: List[Dict[str, Any]] = []
+    used_ids = set()
 
-      if (requestId == _playRequestId) {
-        _currentSong = null;
-        _error = 'Playback failed: $error';
-      }
+    for response in responses:
+        if isinstance(response, Exception):
+            continue
 
-      try {
-        await _audioPlayer.stop();
-      } catch (_) {}
-    } finally {
-      if (requestId == _playRequestId) {
-        _isLoading = false;
-        notifyListeners();
-      }
-    }
-  }
+        results = response.get("data", {}).get("results", [])
+        if not isinstance(results, list):
+            continue
 
-  Future<void> pause() async {
-    await _audioPlayer.pause();
-    notifyListeners();
-  }
+        for song in results:
+            if not isinstance(song, dict):
+                continue
 
-  Future<void> resume() async {
-    await _audioPlayer.play();
-    notifyListeners();
-  }
+            formatted_song = _format_song(song)
+            song_id = formatted_song["id"]
 
-  Future<void> seek(Duration targetPosition) async {
-    await _audioPlayer.seek(targetPosition);
-  }
+            if song_id and song_id not in used_ids:
+                used_ids.add(song_id)
+                songs.append(formatted_song)
 
-  @override
-  void dispose() {
-    _playRequestId++;
-    _debounceTimer?.cancel();
-    _playerStateSubscription?.cancel();
-    _audioPlayer.dispose();
-    super.dispose();
-  }
-}
+            if len(songs) >= limit:
+                return songs
+
+    return songs
+
+
+async def resolve_song_stream(song_id: str) -> Optional[Dict[str, Any]]:
+    clean_song_id = song_id.strip()
+
+    if not clean_song_id:
+        return None
+
+    async with httpx.AsyncClient(
+        base_url=JIOSAAVN_API_BASE,
+        timeout=httpx.Timeout(20.0),
+        follow_redirects=True,
+        headers={"Accept": "application/json"},
+    ) as client:
+        data = await _get_json(client, f"/songs/{clean_song_id}")
+
+    song = data.get("data", [None])
+
+    if isinstance(song, list):
+        song = song[0] if song else None
+
+    if not isinstance(song, dict):
+        return None
+
+    return _format_song(song)
