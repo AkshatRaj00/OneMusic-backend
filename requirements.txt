@@ -10,3 +10,5 @@ cachetools
 python-dotenv
 redis
 structlog
+yt-dlp==2026.8.19
+yt-dlp-ejs

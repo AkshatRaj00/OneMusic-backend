@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: onemusic-backend
+    runtime: python
+    buildCommand: |
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y nodejs
+      pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
