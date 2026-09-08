@@ -41,7 +41,6 @@ class MusicPlayerProvider extends ChangeNotifier {
       (state) {
         if (state.processingState == ProcessingState.completed) {
           _audioPlayer.seek(Duration.zero);
-          _audioPlayer.pause();
         }
 
         notifyListeners();
