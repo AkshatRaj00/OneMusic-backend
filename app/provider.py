@@ -1,185 +1,97 @@
-import asyncio
-from typing import Any, Dict, List, Optional
-import httpx
+import 'package:flutter/foundation.dart';
+import 'package:just_audio/just_audio.dart';
 
-JIOSAAVN_API_BASE = "https://saavn.dev/api"
+import '../core/services/music_api_service.dart';
+import '../models/song_model.dart';
 
-# कनेक्शन पूल को रीयूज़ करने के लिए सिंगल क्लाइंट
-_http_client: Optional[httpx.AsyncClient] = None
+class MusicPlayerProvider extends ChangeNotifier {
+  final AudioPlayer _audioPlayer = AudioPlayer();
 
+  List<SongModel> _songs = [];
+  SongModel? _currentSong;
+  bool _isLoading = false;
+  bool _isSearching = false;
+  String _error = '';
 
-def _get_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            base_url=JIOSAAVN_API_BASE,
-            timeout=httpx.Timeout(15.0),
-            follow_redirects=True,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            },
-        )
-    return _http_client
+  List<SongModel> get songs => _songs;
+  SongModel? get currentSong => _currentSong;
+  bool get isLoading => _isLoading;
+  bool get isSearching => _isSearching;
+  String get error => _error;
+  bool get isPlaying => _audioPlayer.playing;
 
+  Future<void> loadTrending() async {
+    _isLoading = true;
+    _error = '';
+    notifyListeners();
 
-def _clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def _first_image_url(images: Any) -> str:
-    if not isinstance(images, list):
-        return ""
-    # उच्चतम रिज़ॉल्यूशन वाली इमेज के लिए reversed ट्रैवर्सल
-    for image in reversed(images):
-        if isinstance(image, dict):
-            url = _clean_text(image.get("url"))
-            if url:
-                return url
-    return ""
-
-
-def _highest_quality_audio_url(download_urls: Any) -> str:
-    if not isinstance(download_urls, list):
-        return ""
-    # 320kbps / 160kbps (लास्ट आइटम सबसे हाईएस्ट बिटरेट होता है)
-    for item in reversed(download_urls):
-        if isinstance(item, dict):
-            url = _clean_text(item.get("url"))
-            if url:
-                return url
-    return ""
-
-
-def _format_song(song: Dict[str, Any]) -> Dict[str, Any]:
-    artists = song.get("artists", {})
-    primary_artists = artists.get("primary", []) if isinstance(artists, dict) else []
-
-    artist_names = [
-        _clean_text(artist.get("name"))
-        for artist in primary_artists
-        if isinstance(artist, dict) and _clean_text(artist.get("name"))
-    ]
-
-    album = song.get("album", {})
-    album_name = _clean_text(album.get("name")) if isinstance(album, dict) else ""
-
-    # JioSaavn सेकंड में देता है, Flutter को मिलीसेकंड चाहिए
-    duration_seconds = 0
-    try:
-        duration_seconds = int(song.get("duration") or 0)
-    except (ValueError, TypeError):
-        duration_seconds = 0
-
-    best_url = _highest_quality_audio_url(song.get("downloadUrl"))
-
-    return {
-        "id": _clean_text(song.get("id")),
-        "title": _clean_text(song.get("name")) or "Unknown title",
-        "artist": ", ".join(artist_names) or "Unknown artist",
-        "album": album_name,
-        "imageUrl": _first_image_url(song.get("image")),  # ✅ Flutter मॉडल की 'imageUrl'
-        "durationMs": duration_seconds * 1000,            # ✅ मिलीसेकंड में कन्वर्टेड
-        "sourceType": "jiosaavn",
-        "sourceId": _clean_text(song.get("id")),
-        "streamUrl": best_url,
-        "backupUrls": [],
+    try {
+      _songs = await MusicApiService.instance.fetchTrendingSongs();
+    } catch (e) {
+      _error = e.toString();
+      _songs = [];
     }
 
+    _isLoading = false;
+    notifyListeners();
+  }
 
-async def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    client = _get_client()
-    response = await client.get(path, params=params)
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        raise ValueError("Invalid API response")
-    return data
+  Future<void> searchSongs(String query) async {
+    _isSearching = true;
+    _error = '';
+    notifyListeners();
 
+    try {
+      _songs = await MusicApiService.instance.searchSongs(query);
+    } catch (e) {
+      _error = e.toString();
+      _songs = [];
+    }
 
-async def search_all_sources(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    clean_query = query.strip()
-    if not clean_query:
-        return []
+    _isSearching = false;
+    notifyListeners();
+  }
 
-    try:
-        data = await _get_json(
-            "/search/songs",
-            {"query": clean_query, "page": 1, "limit": limit},
-        )
-        results = data.get("data", {}).get("results", [])
-        if not isinstance(results, list):
-            return []
+  Future<void> playSong(SongModel song) async {
+    _isLoading = true;
+    _error = '';
+    notifyListeners();
 
-        return [_format_song(song) for song in results if isinstance(song, dict)]
-    except Exception as e:
-        print(f"[SEARCH ERROR] {e}")
-        return []
+    try {
+      await _audioPlayer.stop();
 
+      final playable =
+          await MusicApiService.instance.resolvePlayableSong(song);
 
-async def get_trending_like_songs(limit: int = 20) -> List[Dict[str, Any]]:
-    queries = ["Hindi hits", "Punjabi hits", "Arijit Singh"]
+      if (playable == null || playable.streamUrl.isEmpty) {
+        throw Exception('Playable stream not found');
+      }
 
-    try:
-        tasks = [
-            _get_json("/search/songs", {"query": q, "page": 1, "limit": 10})
-            for q in queries
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+      await _audioPlayer.setUrl(playable.streamUrl);
+      await _audioPlayer.play();
 
-        songs: List[Dict[str, Any]] = []
-        used_ids = set()
+      _currentSong = playable;
+    } catch (e) {
+      _error = e.toString();
+    }
 
-        for response in responses:
-            if isinstance(response, Exception):
-                continue
+    _isLoading = false;
+    notifyListeners();
+  }
 
-            results = response.get("data", {}).get("results", [])
-            if not isinstance(results, list):
-                continue
+  Future<void> pause() async {
+    await _audioPlayer.pause();
+    notifyListeners();
+  }
 
-            for song in results:
-                if not isinstance(song, dict):
-                    continue
+  Future<void> resume() async {
+    await _audioPlayer.play();
+    notifyListeners();
+  }
 
-                formatted = _format_song(song)
-                s_id = formatted["id"]
-
-                if s_id and s_id not in used_ids:
-                    used_ids.add(s_id)
-                    songs.append(formatted)
-
-                if len(songs) >= limit:
-                    return songs
-
-        return songs
-    except Exception as e:
-        print(f"[TRENDING ERROR] {e}")
-        return []
-
-
-async def resolve_song_stream(song_id: str) -> Optional[Dict[str, Any]]:
-    clean_song_id = song_id.strip()
-    if not clean_song_id:
-        return None
-
-    try:
-        # ✅ JioSaavn API v4 फिक्स: क्वेरी पैरामीटर (?id=...) का उपयोग
-        data = await _get_json("/songs", params={"id": clean_song_id})
-        raw_data = data.get("data")
-
-        song = None
-        if isinstance(raw_data, list) and raw_data:
-            song = raw_data[0]
-        elif isinstance(raw_data, dict):
-            song = raw_data
-
-        if not isinstance(song, dict):
-            return None
-
-        return _format_song(song)
-    except Exception as e:
-        print(f"[RESOLVE ERROR] ID={clean_song_id} | {e}")
-        return None
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+}
